@@ -187,9 +187,12 @@ def k_class_one_vs_one_ker_perc_pred (alpha, x, y, k_classes, K_precal_test, con
         for i, a in enumerate(k_classes):
             for k, b in enumerate (k_classes):
                 if k<i :
-                    K_test_pair = K_precal_test[(i,k)]
-                    K = K_test_pair[j, :]
-                    # K = K_precal[:,i]
+                    K_test_pair = K_precal_test[(i,k)]["K"]
+                    testPos = K_precal_test[(i,k)]["testPos"]
+                    if j not in testPos:
+                        continue
+                    K_test_pair_jrow = np.where(testPos == j)[0][0]
+                    K = K_test_pair[K_test_pair_jrow, :]
                     K = np.array(K)
                     if (alpha[(i,k)] @ K) >= 0:
                         y_hat[i] = y_hat[i]+1
@@ -206,7 +209,7 @@ def k_class_one_vs_one_ker_perc_pred (alpha, x, y, k_classes, K_precal_test, con
     return y_pred, total_errors, confMatrix
 
 
-def two_class_ker_perc_full (df, kernel_func, target_class, epoch = 1, K_precal_train = None, K_precal_test=None, split = None, **kwargs):
+def two_class_ker_perc_full (df, kernel_func, target_class, epoch = 1, K_precal_train = None, split = None, trainhelper=False, **kwargs):
     if split is None : #If no prespecified train test splits given make from scratch
         xtrain, xtest, ytrain, ytest, _, _ = train_test_split(df)
     else : #Otherwise if prespecified train test splits given unpack
@@ -218,18 +221,18 @@ def two_class_ker_perc_full (df, kernel_func, target_class, epoch = 1, K_precal_
     min_epoch_errors = np.inf
     alpha = np.zeros(len(xtrain))
     best_alpha = alpha.copy()
-    if K_precal_train is None :
-        # print('Pre computing Train Kernel')
+    if K_precal_train is None : #Checks to see if a precalculated train Kernel has been passed in, if not calculate
         K_precal_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs)
-        # print('Train Kernel Computed')
     total_errors_train = 0
     for e in range(epoch) :
         epoch_errors = 0
         #print(f"Epoch {e}, Class = {target_class}")
         for i in range(len(xtrain)) :
-            alpha_i = alpha[:i]  # all previous alpha's
-            K = K_precal_train[:i, i]
-            if (alpha_i @ K) >= 0:
+            # alpha_i = alpha[:i]  # all previous alpha's
+            # K = K_precal_train[:i, i]
+            # if (alpha_i @ K) >= 0:
+            K = K_precal_train[:, i]
+            if (alpha @ K) >= 0:
                 y_hat = 1
             else :
                 y_hat = -1
@@ -249,28 +252,11 @@ def two_class_ker_perc_full (df, kernel_func, target_class, epoch = 1, K_precal_
     total_errors_train = min_epoch_errors / len(xtrain)
 
     alpha = best_alpha.copy()
-    if K_precal_test is None :
-        # print('Pre Computing Test Kernel')
+    if trainhelper == False: #If function is being called as a two class classifier complete the predictoin step, otherwise skip predictions
         K_precal_test = full_kern(xtest, kernel_func=kernel_func, x2=xtrain, **kwargs)
-        # print('Test Kernel Computed')
         y_pred_test, total_errors_test = two_class_ker_perc_pred(alpha, xtest, ytest, target_class, K_precal_test)
         return alpha, total_errors_train, y_pred_test, total_errors_test
-    # y_pred = []
-    # total_errors = 0
-    # alpha = np.array(alpha)
-    # for i in range(len(xtest)) :
-    #     K = K_precal_test[i, :]
-    #     # K = K_precal[:,i]
-    #     K = np.array(K)
-    #     if (alpha @ K) >= 0:
-    #         y_hat = 1
-    #     else:
-    #         y_hat = -1
-    #     if y_hat != ytest[i]:
-    #         total_errors = total_errors + 1
-    #     y_pred.append(y_hat)
-    # total_errors = total_errors/len(xtest)
-    return alpha, total_errors_train, None, None
+    return alpha, total_errors_train, None, None #If function being called to do training step in another algorithm only return training outputs
 
 
 def k_class_one_vs_rest_ker_perc (df, kernel_func, k_classes, epoch=1, split=None, K_precal_train = None, K_precal_test = None, confusion=False, **kwargs):
@@ -280,17 +266,12 @@ def k_class_one_vs_rest_ker_perc (df, kernel_func, k_classes, epoch=1, split=Non
         xtrain, xtest, ytrain, ytest = split
     alpha, y_pred_test, train_errors, test_erros = [], [], [], []
     if K_precal_train is None:
-        # print('pre computing  train kernel')
         K_precal_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs) #Precalculate the Kernel Matrix
-        # print('train kernel computed')
     if K_precal_test is None:
-        # print('pre computing test kernel')
         K_precal_test = full_kern(xtest, kernel_func=kernel_func, x2=xtrain, **kwargs)
-        # print('test kernel computed')
-        # print('kernels computed')
     for k in k_classes : #Loop through the k classes
         split = (xtrain, xtest, ytrain.copy(), ytest.copy()) #Store new dataset with y {1,-1} labels
-        alpha_k, train_errors_k, _, _ = two_class_ker_perc_full(None, kernel_func, k, epoch=epoch, K_precal_train=K_precal_train, K_precal_test=K_precal_test, split = split) #Train 2 class classifier, (k vs rest)
+        alpha_k, train_errors_k, _, _ = two_class_ker_perc_full(None, kernel_func, k, epoch=epoch, K_precal_train=K_precal_train, split = split, trainhelper=True) #Train 2 class classifier, (k vs rest)
         alpha.append(alpha_k) #Add k vs rest alpha values to alpha list
         train_errors.append(train_errors_k)
     y_pred_test, test_errors, confMatrix = k_class_one_vs_rest_ker_perc_pred(alpha, xtest, ytest, k_classes, K_precal_test, confusion)
@@ -306,28 +287,26 @@ def k_class_one_vs_one_ker_perc(df, kernel_func, k_classes, epoch=1, split=None,
     alpha, K_train_pairs, K_test_pairs = {}, {}, {}
     y_pred_test, train_errors, test_errors = [], [], []
     if K_precal_train is None:
-        # print('pre computing  train kernel')
-        K_full_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs) #Precalculate the Kernel Matrix
-        # print('train kernel computed')
+        K_precal_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs) #Precalculate the Kernel Matrix
     if K_precal_test is None:
-        # print('pre computing test kernel')
-        K_full_test = full_kern(xtest, kernel_func=kernel_func, x2=xtrain, **kwargs)
+        K_precal_test = full_kern(xtest, kernel_func=kernel_func, x2=xtrain, **kwargs)
     for i in k_classes :
         for k  in k_classes:
             if k < i :
                 trainPos = np.where((ytrain == i)|((ytrain == k)))[0]
                 ytrain_pair = ytrain[trainPos]
                 xtrain_pair = xtrain[trainPos]
-                # testPos = np.where((ytest == i) | ((ytest == k)))[0]
-                # ytest_pair = ytest[testPos]
-                # xtest_pair = xtest[testPos]
+                testPos = np.where((ytest == i) | ((ytest == k)))[0]
+                ytest_pair = ytest[testPos]
+                xtest_pair = xtest[testPos]
                 split = (xtrain_pair, None, ytrain_pair, None)
-                K_train_pair = K_full_train[np.ix_(trainPos, trainPos)]  # Precalculate the Kernel Matrix
-                K_test_pair  = K_full_test[:,trainPos]
-                alpha_ik, train_errors_k, _, _ = two_class_ker_perc_full(None, kernel_func, i, epoch=epoch,K_precal_train=K_train_pair,K_precal_test=K_test_pair,split=split)  # Train 2 class classifier, (k vs rest)
+                K_train_pair = K_precal_train[np.ix_(trainPos, trainPos)]  # Precalculate the Kernel Matrix
+                # K_test_pair  = K_precal_test[:,trainPos]
+                K_test_pair = K_precal_test[np.ix_(testPos, trainPos)]
+                alpha_ik, train_errors_k, _, _ = two_class_ker_perc_full(None, kernel_func, i, epoch=epoch,K_precal_train=K_train_pair,split=split, trainhelper=True)  # Train 2 class classifier, (k vs rest)
                 alpha[(i,k)] = alpha_ik  # Add k vs rest alpha values to alpha list
                 K_train_pairs[(i, k)] = K_train_pair
-                K_test_pairs[(i,k)] = K_test_pair
+                K_test_pairs[(i,k)] = {"K" : K_test_pair, "testPos": testPos}
                 train_errors.append(train_errors_k)
     y_pred_test, test_errors, confMatrix = k_class_one_vs_one_ker_perc_pred(alpha, xtest, ytest, k_classes, K_test_pairs, confusion)
     me_train = np.mean(train_errors)
@@ -336,60 +315,38 @@ def k_class_one_vs_one_ker_perc(df, kernel_func, k_classes, epoch=1, split=None,
 
 def cross_validation(xtrain, ytrain, folds, algorithm_func, kernel_func, paramlist, k_classes, epoch_lim=1, **kwargs):
     positions = np.arange(len(xtrain))
-    np.random.shuffle(positions)
     foldPositions = np.array_split(positions, folds)
-
 
     K_precal = {p: full_kern(xtrain, kernel_func=kernel_func, d=p, c=p) for p in paramlist}
 
-
-    paraMatrix = paramlist
-
-    cross_results = []
-    results = np.zeros((folds, len(paramlist), 2))
+    results = np.zeros((folds, len(paramlist), 1))
     for j, p in enumerate(paramlist):
-        K_full = K_precal[p]
+        K_train_full = K_precal[p]
 
         for i in range(folds):
 
-            xtrain_fold = np.concatenate([foldPositions[f] for f in range(folds) if f != i])
-            xtest_fold = foldPositions[i]
+            xtrain_foldPos = np.concatenate([foldPositions[f] for f in range(folds) if f != i])
+            xtest_foldPos = foldPositions[i]
 
-
-            K_train = K_full[np.ix_(xtrain_fold, xtrain_fold)]
-            K_test = K_full[np.ix_(xtest_fold, xtrain_fold)]
-            ytrain_fold = ytrain[xtrain_fold]
-            ytest_fold = ytrain[xtest_fold]
-            xtrain_fold = xtrain[xtrain_fold]
-            xtest_fold = xtrain[xtest_fold]
+            K_train = K_train_full[np.ix_(xtrain_foldPos, xtrain_foldPos)]
+            K_test = K_train_full[np.ix_(xtest_foldPos, xtrain_foldPos)]
+            ytrain_fold = ytrain[xtrain_foldPos]
+            ytest_fold = ytrain[xtest_foldPos]
+            xtrain_fold = xtrain[xtrain_foldPos]
+            xtest_fold = xtrain[xtest_foldPos]
             split_fold = (xtrain_fold, xtest_fold, ytrain_fold, ytest_fold)
 
-            alpha, y_pred_test, me_train, me_test, _, _, _ = algorithm_func(None, kernel_func, k_classes, epoch=epoch_lim, split=split_fold, K_precal_train = K_train, K_precal_test = K_test, d=p, c=p)
-            results[i, j, 0] = me_train
-            results[i, j, 1] = me_test
+            _, _, _, me_test, *_ = algorithm_func(None, kernel_func, k_classes, epoch=epoch_lim, split=split_fold,
+                                                  K_precal_train=K_train, K_precal_test=K_test, d=p, c=p)
 
-            # alpha = ker_ridg_sol(K_train, gam, ytrain_fold)
-            # y_hat_train = K_train @ alpha
-            # y_hat_test = K_test @ alpha
-            # mse_train_fold = np.mean((ytrain_fold - y_hat_train) ** 2)
-            # mse_test_fold = np.mean((ytest_fold - y_hat_test) ** 2)
-            # mse = [mse_train_fold, mse_test_fold]
-            # results.append(mse)
-    avgme_train = np.mean(results[:, :, 0], axis=0)
-    avgme_test = np.mean(results[:, :, 1], axis=0)
-        # avgmse = [0, 0]
-        #
-        # for i in range(2):
-        #     total = 0
-        #     for j in range(folds):
-        #         total += results[j][i]
-        #     avgmse[i] = total / folds
+            results[i, j, 0] = me_test
 
-    avgme_df = pd.DataFrame({'Param': paramlist, 'avg_me_train_fold': avgme_train, 'avg_me_test_fold': avgme_test})
-    # cross_results = pd.concat(cross_results)
+    avgme_test = np.mean(results[:, :, 0], axis=0)
+
+    avgme_df = pd.DataFrame({'Param': paramlist, 'avg_me_test_fold': avgme_test})
     avgme_df = avgme_df.sort_values(by ='avg_me_test_fold', ascending=True)
     min_me = avgme_df.iloc[0]
-    return float(min_me['Param']), min_me['avg_me_train_fold'], min_me['avg_me_test_fold'], avgme_df
+    return float(min_me['Param']), min_me['avg_me_test_fold'], avgme_df
 
 
 # Runs r reps of model fitting, each with different train/test splits, returns the average MSE across runs (train and test)
@@ -417,7 +374,7 @@ def r_sims_k_class_ker_perc(df, r, k_classes, param, algorithm_func=k_class_one_
             xtrain, xtest, ytrain, ytest, trainpos, testpos = splits[i]
             split = (xtrain, xtest, ytrain.copy(), ytest.copy())
         if crossVal == True:
-            minparam, _, _, crossValdf= cross_validation(xtrain, ytrain, 5, algorithm_func, kernel_func, param, k_classes, epoch_lim=epoch_lim)
+            minparam, _, crossValdf= cross_validation(xtrain, ytrain, 5, algorithm_func, kernel_func, param, k_classes, epoch_lim=epoch_lim)
 
             best_params.append({
                 "run": int(i),
@@ -431,10 +388,7 @@ def r_sims_k_class_ker_perc(df, r, k_classes, param, algorithm_func=k_class_one_
         else :
             minparam = None
             for j, p in enumerate(param):
-                # print(f'run {i}, parameter {p}')
-        #print(f'For r = {i+1}, minsig = 2**{np.log2(minsig)}, mingam = 2**{np.log2(mingam)}')
-                alpha, y_pred_test, me_train, me_test, _, _, _= algorithm_func(None, kernel_func, k_classes, epoch = epoch_lim, split=split, d=p, c=p)
-        #krm = ker_reg_sol(xtrain, ytrain, kernel_func, sig=minsig, gam=mingam)
+                alpha, y_pred_test, me_train, me_test, *_ = algorithm_func(None, kernel_func, k_classes, epoch = epoch_lim, split=split, d=p, c=p)
                 results[i,j,0] = me_train
                 results[i,j,1] = me_test
         tested_counts[testpos] = tested_counts[testpos] + 1
@@ -487,10 +441,10 @@ def plot_pixel_images(hard, hard_pred):
 
 
 url = 'http://www0.cs.ucl.ac.uk/staff/M.Herbster/SL/misc/zipcombo.dat'
-# data = np.loadtxt("zipcombo.dat")
-# df = pd.DataFrame(data)
-# dftest = df.sample(frac=0.15, random_state=0).reset_index(drop=True)
-df = pd.read_csv(url, delim_whitespace=True, header=None)
+data = np.loadtxt("zipcombo.dat")
+df = pd.DataFrame(data)
+# df = pd.read_csv(url, sep=r"\s+", header=None)
+dftest = df.sample(frac=0.30, random_state=0).reset_index(drop=True)
 print(df.head())
 
 print('Q1')
@@ -616,8 +570,38 @@ print(avgconfMatrix)
 
 fig, ax = plot_pixel_images(hard, hard_pred)
 
+print('Extension : one vs one Gaussian kenrel')
+runs = 20
+c = [2**(-b/2) for b in range(6, 13)]
+Classes = [0,1,2,3,4,5,6,7,8,9]
+start = time.time()
+avgme_df, _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, split=rsplits)
+end = time.time()
+print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
+print('K class kernel perceptron classifier, one vs one')
+print(f'Guassian Kernel : {runs} runs')
+print(avgme_df)
+
+runs = 20
+c = [2**(-b/2) for b in range(6, 13)]
+Classes = [0,1,2,3,4,5,6,7,8,9]
+start = time.time()
+avgme_df, avgconfMatrix, hard, hard_pred = r_sims_k_class_ker_perc(df, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, split=rsplits, crossVal=True, confusion=True)
+end = time.time()
+print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
+print('K class kernel perceptron classifier, one vs one')
+print(f'Guassian Kernel : {runs} runs with cross validation')
+print(avgme_df)
+
+print('Average Confusion Matrix')
+avgconfMatrix = confusion_matrix_df(avgconfMatrix, Classes)
+print(avgconfMatrix)
+
+fig, ax = plot_pixel_images(hard, hard_pred)
+
 print('(d)')
 
 
 plt.show()
 plt.close()
+
