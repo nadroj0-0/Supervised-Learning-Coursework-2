@@ -8,6 +8,287 @@ import matplotlib.pyplot as plt
 import requests
 from io import StringIO
 
+import json
+import os
+# Saving results and figures functions
+#Saves a figure in Figures folder
+def save_figure(fig, filename: str):
+    path = os.path.join("outputs", "figures", filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+
+#Saves a json file in results folder
+def save_json(data: dict, filename: str):
+    path = os.path.join("outputs", "results", filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4)
+
+def to_json_safe(obj):
+    if isinstance(obj, dict):
+        return {k: to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    return obj
+
+def latex_escape(s: str) -> str:
+    # If user already provided LaTeX math, don't touch it.
+    if "$" in s:
+        return s
+
+    repl = [
+        ("\\", r"\textbackslash{}"),
+        ("&", r"\&"),
+        ("%", r"\%"),
+        ("$", r"\$"),
+        ("#", r"\#"),
+        ("_", r"\_"),
+        ("{", r"\{"),
+        ("}", r"\}"),
+        ("~", r"\textasciitilde{}"),
+        ("^", r"\textasciicircum{}"),   # <-- fine for normal text, but math handled above
+        ("±", r"$\pm$"),
+    ]
+    for a, b in repl:
+        s = s.replace(a, b)
+    return s
+
+
+def wrap_latex_table_small(path):
+    with open(path, "r") as f:
+        content = f.read()
+
+    wrapped = (
+        "\\begingroup\n"
+        "\\scriptsize\n"
+        "\\setlength{\\tabcolsep}{3pt}\n"
+        + content +
+        "\n\\endgroup\n"
+    )
+
+    with open(path, "w") as f:
+        f.write(wrapped)
+
+def postprocess_q3(*, avgme_df: pd.DataFrame, model_id: str, param_symbol: str = "d"):
+    """
+    Post-process Q3-style results with automatic filenames.
+
+    Parameters
+    ----------
+    avgme_df : pd.DataFrame
+        Output from r_sims_k_class_ker_perc
+    model_id : str
+        e.g. "OvR_poly", "OvR_gauss", "OvO_poly"
+    param_symbol : str
+        "d" (polynomial, default) or "c" (Gaussian)
+    """
+
+    def c_to_pow2_tex(c_val: float) -> str:
+        # assumes c_val = 2^(-b/2) for integer b
+        b = int(round(-2 * np.log2(c_val)))
+        return f"$2^{{-{b}/2}}$"
+
+    question_id = f"{model_id}_Q3"
+    if param_symbol == "c":
+        display_param = avgme_df["param"].map(c_to_pow2_tex)
+        json_param = avgme_df["param"].astype(float).tolist()
+        param_col = "c"
+    else:
+        display_param = avgme_df["param"]
+        json_param = avgme_df["param"].tolist()
+        param_col = "d"
+
+    q3_table = pd.DataFrame({
+        param_col: display_param,
+        "mean train error rates (%)": (
+                                              100 * avgme_df["avg_me_train"]
+                                      ).round(3).astype(str) + " ± " + (100 * avgme_df["avg_me_train_sd"]).round(
+            3).astype(str),
+        "mean test error rates (%)": (
+                                             100 * avgme_df["avg_me_test"]
+                                     ).round(3).astype(str) + " ± " + (100 * avgme_df["avg_me_test_sd"]).round(
+            3).astype(str),
+    })
+
+    save_outputs(
+        question_id=question_id,
+        tables={"summary": q3_table},
+        jsons={
+            "train_test_stats": {
+                param_col: json_param,  # <- decimals for plotting etc.
+                "train_mean": avgme_df["avg_me_train"].tolist(),
+                "train_sd": avgme_df["avg_me_train_sd"].tolist(),
+                "test_mean": avgme_df["avg_me_test"].tolist(),
+                "test_sd": avgme_df["avg_me_test_sd"].tolist(),
+            }
+        }
+    )
+
+
+
+def postprocess_experiment(
+    *,
+    question_prefix: str,
+    avgme_df=None,
+    best_params=None,
+    avgconfMatrix=None,
+    hard=None,
+    hard_pred=None,
+    classes=None,
+    param_symbol: str = "d"
+):
+    """
+    Post-processes experiment outputs:
+    - Q4-style CV table (if best_params provided)
+    - Q5 confusion matrix (LaTeX + JSON, if avgconfMatrix provided)
+    - Q6 hard examples figure (if hard provided)
+    """
+
+    # -------------------------
+    # Q4: CV runs table
+    # -------------------------
+    def df_to_tex_with_index(df, filename: str):
+        path = os.path.join("outputs", "tex", filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_latex(
+            path,
+            index=True,          # <-- key difference
+            header=True,
+            escape=False
+        )
+
+    if best_params is not None:
+        q4_table = pd.DataFrame({
+            "run": [(bp["run"] + 1) for bp in best_params],
+            f"{param_symbol}*": [bp["best_param"] for bp in best_params],
+            "test error rate (%)": [(100 * bp["test_error"]).round(4) for bp in best_params]
+        })
+
+        save_outputs(
+            question_id=f"{question_prefix}_Q4",
+            tables={"cv_runs": q4_table}
+        )
+
+    # -------------------------
+    # Q5: Confusion matrix
+    # -------------------------
+    if avgconfMatrix is not None and classes is not None:
+        avgconfMatrix_raw = avgconfMatrix.copy()
+
+        # Build formatted % mean ± std table
+        conf_pct = np.empty((len(classes), len(classes)), dtype=object)
+        for i in range(len(classes)):
+            for j in range(len(classes)):
+                mean = avgconfMatrix_raw[i, j, 0] * 100
+                sd   = avgconfMatrix_raw[i, j, 1] * 100
+                conf_pct[i, j] = f"{mean:.3f} ± {sd:.3f}"
+
+        conf_df = pd.DataFrame(
+            conf_pct,
+            index=[str(c) for c in classes],
+            columns=[f"\\textbf{{{c}}}" for c in classes]
+        )
+        conf_df.index.name = r" "
+
+        # Save LaTeX (index ON)
+        df_to_tex_with_index(conf_df, f"{question_prefix}_Q5_confusion.tex")
+        wrap_latex_table_small(f"outputs/tex/{question_prefix}_Q5_confusion.tex")
+
+        # Save JSON
+        conf_json = {
+            "classes": classes,
+            "mean_percent": (avgconfMatrix_raw[:, :, 0] * 100).tolist(),
+            "std_percent":  (avgconfMatrix_raw[:, :, 1] * 100).tolist()
+        }
+
+        save_outputs(
+            question_id=f"{question_prefix}_Q5",
+            jsons={"avg_confusion_matrix_pct": conf_json}
+        )
+
+    # -------------------------
+    # Q6: Hard examples
+    # -------------------------
+    if hard is not None and hard_pred is not None:
+        fig, ax = plot_pixel_images(hard, hard_pred)
+
+        save_outputs(
+            question_id=f"{question_prefix}_Q6",
+            figures={"hard_examples": fig}
+        )
+
+
+#Saves a latex file in the tex folder for writing up in latex
+def df_to_tex(df, filename: str):
+    path = os.path.join("outputs", "tex", filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for col in df.columns:
+        try:
+            df[col] = pd.to_numeric(df[col])
+        except Exception:
+            pass
+    df = df.copy()
+    df.columns = df.columns.astype(str)
+    df.columns = [latex_escape(c) for c in df.columns]
+
+    # Escape every string cell (only object columns)
+    obj_cols = df.select_dtypes(include="object").columns
+    for col in obj_cols:
+        df[col] = df[col].map(lambda x: latex_escape(str(x)) if pd.notna(x) else x)
+    df.to_latex(path, index=False, header=True, float_format="%.4f", escape=False)
+
+def json_to_tex(data: dict, filename: str):
+    rows = []
+    for k, v in data.items():
+        rows.append([k, v])
+
+    df = pd.DataFrame(rows)
+    path = os.path.join("outputs", "tex", filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    df.to_latex(path, index=False, header=False, float_format="%.4f", escape=False)
+
+def save_outputs(
+    *,
+    question_id: str,
+    tables: dict = None,
+    figures: dict = None,
+    jsons: dict = None
+):
+    """
+    Saves experiment outputs (tables, figures, jsons) in a structured way.
+
+    Parameters
+    ----------
+    question_id : str
+        e.g. "Q3", "Q4", "Q8_ovo_poly"
+    tables : dict[str, pd.DataFrame]
+        {name: dataframe}
+    figures : dict[str, matplotlib.figure.Figure]
+        {name: figure}
+    jsons : dict[str, dict]
+        {name: json_serialisable_object}
+    """
+
+    if tables:
+        for name, df in tables.items():
+            df_to_tex(df, f"{question_id}_{name}.tex")
+
+    if figures:
+        for name, fig in figures.items():
+            save_figure(fig, f"{question_id}_{name}.png")
+
+    if jsons:
+        for name, data in jsons.items():
+            save_json(to_json_safe(data), f"{question_id}_{name}.json")
+
+
 #def row_kern (x1, kernel_func, x2=None, *kwargs):
 #     x1 = np.asarray(x1)
 #     n1 = len(x1)
@@ -110,25 +391,6 @@ def random_epoch (x, y):
     return xtrain_epoch, ytrain_epoch, reordered
 
 
-
-
-def two_class_ker_perc_pred (alpha, x, y, target_class, K_precal_test):
-    y_pred = []
-    total_errors = 0
-    for i in range(len(x)):
-        K = K_precal_test[i, :]
-        # K = K_precal[:,i]
-        K = np.array(K)
-        if (alpha @ K) >= 0:
-            y_hat = 1
-        else:
-            y_hat = -1
-        if y_hat != y[i]:
-            total_errors = total_errors + 1
-        y_pred.append(y_hat)
-    total_errors = total_errors / len(x)
-    return y_pred, total_errors
-
 def confusion_matrix(y, yhat, Classes):
     confMatrix = np.zeros((len(Classes), len(Classes)))
     digitCounts = np.zeros(len(Classes))
@@ -159,17 +421,115 @@ def confusion_matrix_df(confMatrix, Classes):
             df[i,j] = f'{me}±{sd}'
     return pd.DataFrame(df, index=Classes, columns=Classes)
 
-def k_class_one_vs_rest_ker_perc_pred (alpha, x, y, k_classes, K_precal_test, confusion=False):
+def two_class_ker_perc_pred (alpha, x, y, xtrain_online, target_class, K_precal_test):
+    y_pred = []
+    total_errors = 0
+    A = np.array(alpha)
+    for i in range(len(x)):
+        if len(alpha) == 0:
+            score = 0
+        else :
+            K = K_precal_test[i, xtrain_online]
+            score = (A @ K)
+        # K = K_precal_test[i, :]
+        # K = K_precal[:,i]
+        # K = np.array(K)
+        if score >= 0:
+            y_hat = 1
+        else:
+            y_hat = -1
+        if y_hat != y[i]:
+            total_errors = total_errors + 1
+        y_pred.append(y_hat)
+    total_errors = total_errors / len(x)
+    return y_pred, total_errors
+
+def two_class_ker_perc_full (df, kernel_func, target_class, epoch = 1, K_precal_train = None, split = None, trainhelper=False, **kwargs):
+    if split is None : #If no prespecified train test splits given make from scratch
+        xtrain, xtest, ytrain, ytest, _, _ = train_test_split(df)
+    else : #Otherwise if prespecified train test splits given unpack
+        xtrain, xtest, ytrain, ytest = split
+    ytrain = np.where(ytrain == target_class, 1, -1)  # Change ytrain 1 = target_class, -1 otherwise
+    ytest = np.where(ytest == target_class, 1, -1)  # Same for ytest
+    epoch_threshold = 3
+    no_improvement_count = 0
+    min_epoch_errors = np.inf
+    # alpha = np.zeros(len(xtrain))
+    alpha = []
+    xtrain_online = []
+    best_alpha = alpha.copy()
+    if K_precal_train is None : #Checks to see if a precalculated train Kernel has been passed in, if not calculate
+        K_precal_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs)
+    total_errors_train = 0
+    for e in range(epoch) :
+        epoch_errors = 0
+        #print(f"Epoch {e}, Class = {target_class}")
+        for i in range(len(xtrain)) :
+            if len(xtrain_online) == 0:
+                score = 0
+            else :
+                K = K_precal_train[xtrain_online, i]
+                A = np.array(alpha)
+                score = A @ K
+            # alpha_i = alpha[:i]  # all previous alpha's
+            # K = K_precal_train[:i, i]
+            # if (alpha_i @ K) >= 0:
+            # K = K_precal_train[:, i]
+            # K = K_precal_train[xtrain_online, i]
+            if (score) >= 0:
+                y_hat = 1
+            else :
+                y_hat = -1
+            if y_hat != ytrain[i] :
+                # alpha[i] = alpha[i] + ytrain[i]
+                alpha.append(ytrain[i])
+                xtrain_online.append(i)
+                epoch_errors = epoch_errors + 1
+                total_errors_train = total_errors_train + 1
+        if epoch_errors < min_epoch_errors:
+            min_epoch_errors = epoch_errors
+            no_improvement_count = 0
+            best_alpha = alpha.copy()
+            best_xtrain_online = xtrain_online.copy()
+        else :
+            no_improvement_count = no_improvement_count + 1
+        if no_improvement_count >= epoch_threshold:
+            #print(f"Stopped early at epoch {e} for class {target_class}")
+            break
+    total_errors_train = min_epoch_errors / len(xtrain)
+
+    alpha = best_alpha.copy()
+    xtrain_online = best_xtrain_online.copy()
+    if trainhelper == False: #If function is being called as a two class classifier complete the predictoin step, otherwise skip predictions
+        K_precal_test = full_kern(xtest, kernel_func=kernel_func, x2=xtrain, **kwargs)
+        y_pred_test, total_errors_test = two_class_ker_perc_pred(alpha, xtest, ytest, xtrain_online, target_class, K_precal_test)
+        print("Alpha length:", len(alpha))
+        print("Online history length:", len(xtrain_online))
+        print("Max : Epochs * train size:", epoch * len(xtrain))
+        return alpha, total_errors_train, xtrain_online, y_pred_test, total_errors_test
+    return alpha, total_errors_train, xtrain_online, None, None #If function being called to do training step in another algorithm only return training outputs
+
+def k_class_one_vs_rest_ker_perc_pred (alpha, x, y, xtrain_online, k_classes, K_precal_test, confusion=False):
     y_pred = []
     total_errors = 0
     for i in range(len(x)) :
-        y_hat = []
-        K = K_precal_test[i, :]
+        # y_hat = []
+        scores = []
+        # K = K_precal_test[i, :]
         # K = K_precal[:,i)
-        K = np.array(K)
+        # K = np.array(K)
         for j, k in enumerate (k_classes) :
-            y_hat.append(alpha[j] @ K)
-        y_pred.append(k_classes[y_hat.index(max(y_hat))])
+            A = np.array(alpha[j])
+            xtrain_online_j = xtrain_online[j]
+            if len(A) == 0:
+                score=0
+            else :
+                K = K_precal_test[i, xtrain_online_j]
+                score = (A @ K)
+            scores.append(score)
+            # y_hat.append(alpha[j] @ K)
+        y_pred.append(k_classes[np.argmax(scores)])
+        # y_pred.append(k_classes[scores.index(max(scores))])
         if y_pred[i] != y[i]:
             total_errors = total_errors + 1
     if confusion == True:
@@ -179,7 +539,28 @@ def k_class_one_vs_rest_ker_perc_pred (alpha, x, y, k_classes, K_precal_test, co
     total_errors = total_errors/len(x)
     return y_pred, total_errors, confMatrix
 
-def k_class_one_vs_one_ker_perc_pred (alpha, x, y, k_classes, K_precal_test, confusion=False):
+def k_class_one_vs_rest_ker_perc (df, kernel_func, k_classes, epoch=1, split=None, K_precal_train = None, K_precal_test = None, confusion=False, **kwargs):
+    if split is None :
+        xtrain, xtest, ytrain, ytest, _, _ = train_test_split(df) #create test train splits
+    else :
+        xtrain, xtest, ytrain, ytest = split
+    alpha, y_pred_test, train_errors, test_erros, xtrain_online = [], [], [], [], []
+    if K_precal_train is None:
+        K_precal_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs) #Precalculate the Kernel Matrix
+    if K_precal_test is None:
+        K_precal_test = full_kern(xtest, kernel_func=kernel_func, x2=xtrain, **kwargs)
+    for k in k_classes : #Loop through the k classes
+        split = (xtrain, xtest, ytrain.copy(), ytest.copy()) #Store new dataset with y {1,-1} labels
+        alpha_k, train_errors_k, xtrain_online_k, _, _ = two_class_ker_perc_full(None, kernel_func, k, epoch=epoch, K_precal_train=K_precal_train, split = split, trainhelper=True) #Train 2 class classifier, (k vs rest)
+        alpha.append(alpha_k) #Add k vs rest alpha values to alpha list
+        xtrain_online.append(xtrain_online_k)
+        train_errors.append(train_errors_k)
+    y_pred_test, test_errors, confMatrix = k_class_one_vs_rest_ker_perc_pred(alpha, xtest, ytest, xtrain_online, k_classes, K_precal_test, confusion)
+    me_train = np.mean(train_errors)
+    me_test = np.mean(test_errors)
+    return alpha, y_pred_test, me_train, me_test, train_errors, test_errors, confMatrix
+
+def k_class_one_vs_one_ker_perc_pred (alpha, x, y, xtrain_online, k_classes, K_precal_test, confusion=False):
     y_pred = []
     total_errors = 0
     for j in range(len(x)):
@@ -192,9 +573,17 @@ def k_class_one_vs_one_ker_perc_pred (alpha, x, y, k_classes, K_precal_test, con
                     if j not in testPos:
                         continue
                     K_test_pair_jrow = np.where(testPos == j)[0][0]
-                    K = K_test_pair[K_test_pair_jrow, :]
-                    K = np.array(K)
-                    if (alpha[(i,k)] @ K) >= 0:
+                    # K = K_test_pair[K_test_pair_jrow, :]
+                    # K = np.array(K)
+                    A = np.array(alpha[(i,k)])
+                    xtrain_online_ik = xtrain_online[(i,k)]
+                    if len(A) == 0:
+                        score=0
+                    else :
+                        K = K_test_pair[K_test_pair_jrow, xtrain_online_ik]
+                        score = (A @ K)
+                    # if (alpha[(i,k)] @ K) >= 0:
+                    if score >= 0:
                         y_hat[i] = y_hat[i]+1
                     else:
                         y_hat[k] = y_hat[k]+1
@@ -208,83 +597,12 @@ def k_class_one_vs_one_ker_perc_pred (alpha, x, y, k_classes, K_precal_test, con
     total_errors = total_errors/len(x)
     return y_pred, total_errors, confMatrix
 
-
-def two_class_ker_perc_full (df, kernel_func, target_class, epoch = 1, K_precal_train = None, split = None, trainhelper=False, **kwargs):
-    if split is None : #If no prespecified train test splits given make from scratch
-        xtrain, xtest, ytrain, ytest, _, _ = train_test_split(df)
-    else : #Otherwise if prespecified train test splits given unpack
-        xtrain, xtest, ytrain, ytest = split
-    ytrain = np.where(ytrain == target_class, 1, -1)  # Change ytrain 1 = target_class, -1 otherwise
-    ytest = np.where(ytest == target_class, 1, -1)  # Same for ytest
-    epoch_threshold = 3
-    no_improvement_count = 0
-    min_epoch_errors = np.inf
-    alpha = np.zeros(len(xtrain))
-    best_alpha = alpha.copy()
-    if K_precal_train is None : #Checks to see if a precalculated train Kernel has been passed in, if not calculate
-        K_precal_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs)
-    total_errors_train = 0
-    for e in range(epoch) :
-        epoch_errors = 0
-        #print(f"Epoch {e}, Class = {target_class}")
-        for i in range(len(xtrain)) :
-            # alpha_i = alpha[:i]  # all previous alpha's
-            # K = K_precal_train[:i, i]
-            # if (alpha_i @ K) >= 0:
-            K = K_precal_train[:, i]
-            if (alpha @ K) >= 0:
-                y_hat = 1
-            else :
-                y_hat = -1
-            if y_hat != ytrain[i] :
-                alpha[i] = alpha[i] + ytrain[i]
-                epoch_errors = epoch_errors + 1
-                total_errors_train = total_errors_train + 1
-        if epoch_errors < min_epoch_errors:
-            min_epoch_errors = epoch_errors
-            no_improvement_count = 0
-            best_alpha = alpha.copy()
-        else :
-            no_improvement_count = no_improvement_count + 1
-        if no_improvement_count >= epoch_threshold:
-            #print(f"Stopped early at epoch {e} for class {target_class}")
-            break
-    total_errors_train = min_epoch_errors / len(xtrain)
-
-    alpha = best_alpha.copy()
-    if trainhelper == False: #If function is being called as a two class classifier complete the predictoin step, otherwise skip predictions
-        K_precal_test = full_kern(xtest, kernel_func=kernel_func, x2=xtrain, **kwargs)
-        y_pred_test, total_errors_test = two_class_ker_perc_pred(alpha, xtest, ytest, target_class, K_precal_test)
-        return alpha, total_errors_train, y_pred_test, total_errors_test
-    return alpha, total_errors_train, None, None #If function being called to do training step in another algorithm only return training outputs
-
-
-def k_class_one_vs_rest_ker_perc (df, kernel_func, k_classes, epoch=1, split=None, K_precal_train = None, K_precal_test = None, confusion=False, **kwargs):
-    if split is None :
-        xtrain, xtest, ytrain, ytest, _, _ = train_test_split(df) #create test train splits
-    else :
-        xtrain, xtest, ytrain, ytest = split
-    alpha, y_pred_test, train_errors, test_erros = [], [], [], []
-    if K_precal_train is None:
-        K_precal_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs) #Precalculate the Kernel Matrix
-    if K_precal_test is None:
-        K_precal_test = full_kern(xtest, kernel_func=kernel_func, x2=xtrain, **kwargs)
-    for k in k_classes : #Loop through the k classes
-        split = (xtrain, xtest, ytrain.copy(), ytest.copy()) #Store new dataset with y {1,-1} labels
-        alpha_k, train_errors_k, _, _ = two_class_ker_perc_full(None, kernel_func, k, epoch=epoch, K_precal_train=K_precal_train, split = split, trainhelper=True) #Train 2 class classifier, (k vs rest)
-        alpha.append(alpha_k) #Add k vs rest alpha values to alpha list
-        train_errors.append(train_errors_k)
-    y_pred_test, test_errors, confMatrix = k_class_one_vs_rest_ker_perc_pred(alpha, xtest, ytest, k_classes, K_precal_test, confusion)
-    me_train = np.mean(train_errors)
-    me_test = np.mean(test_errors)
-    return alpha, y_pred_test, me_train, me_test, train_errors, test_errors, confMatrix
-
 def k_class_one_vs_one_ker_perc(df, kernel_func, k_classes, epoch=1, split=None, K_precal_train = None, K_precal_test = None, confusion=False, **kwargs):
     if split is None:
         xtrain, xtest, ytrain, ytest, _, _ = train_test_split(df)  # create test train splits
     else:
         xtrain, xtest, ytrain, ytest = split
-    alpha, K_train_pairs, K_test_pairs = {}, {}, {}
+    alpha, K_train_pairs, K_test_pairs, xtrain_online = {}, {}, {}, {}
     y_pred_test, train_errors, test_errors = [], [], []
     if K_precal_train is None:
         K_precal_train = full_kern(xtrain, kernel_func=kernel_func, **kwargs) #Precalculate the Kernel Matrix
@@ -303,12 +621,13 @@ def k_class_one_vs_one_ker_perc(df, kernel_func, k_classes, epoch=1, split=None,
                 K_train_pair = K_precal_train[np.ix_(trainPos, trainPos)]  # Precalculate the Kernel Matrix
                 # K_test_pair  = K_precal_test[:,trainPos]
                 K_test_pair = K_precal_test[np.ix_(testPos, trainPos)]
-                alpha_ik, train_errors_k, _, _ = two_class_ker_perc_full(None, kernel_func, i, epoch=epoch,K_precal_train=K_train_pair,split=split, trainhelper=True)  # Train 2 class classifier, (k vs rest)
+                alpha_ik, train_errors_ik, xtrain_online_ik, _, _ = two_class_ker_perc_full(None, kernel_func, i, epoch=epoch,K_precal_train=K_train_pair,split=split, trainhelper=True)  # Train 2 class classifier, (k vs rest)
                 alpha[(i,k)] = alpha_ik  # Add k vs rest alpha values to alpha list
+                xtrain_online[(i,k)] = xtrain_online_ik
                 K_train_pairs[(i, k)] = K_train_pair
                 K_test_pairs[(i,k)] = {"K" : K_test_pair, "testPos": testPos}
-                train_errors.append(train_errors_k)
-    y_pred_test, test_errors, confMatrix = k_class_one_vs_one_ker_perc_pred(alpha, xtest, ytest, k_classes, K_test_pairs, confusion)
+                train_errors.append(train_errors_ik)
+    y_pred_test, test_errors, confMatrix = k_class_one_vs_one_ker_perc_pred(alpha, xtest, ytest, xtrain_online, k_classes, K_test_pairs, confusion)
     me_train = np.mean(train_errors)
     me_test = np.mean(test_errors)
     return alpha, y_pred_test, me_train, me_test, train_errors, test_errors, confMatrix
@@ -350,7 +669,7 @@ def cross_validation(xtrain, ytrain, folds, algorithm_func, kernel_func, paramli
 
 
 # Runs r reps of model fitting, each with different train/test splits, returns the average MSE across runs (train and test)
-def r_sims_k_class_ker_perc(df, r, k_classes, param, algorithm_func=k_class_one_vs_rest_ker_perc, kernel_func=poly_kern, epoch_lim = 10, splits=None,  crossVal=False, confusion=False, **kwargs) :
+def r_sims_k_class_ker_perc(df, r, k_classes, param, algorithm_func=k_class_one_vs_rest_ker_perc, kernel_func=poly_kern, epoch_lim = 1, splits=None,  crossVal=False, confusion=False, **kwargs) :
     if crossVal == True:
         results = np.zeros((r, 1, 2))
     else:
@@ -374,11 +693,12 @@ def r_sims_k_class_ker_perc(df, r, k_classes, param, algorithm_func=k_class_one_
             xtrain, xtest, ytrain, ytest, trainpos, testpos = splits[i]
             split = (xtrain, xtest, ytrain.copy(), ytest.copy())
         if crossVal == True:
-            minparam, _, crossValdf= cross_validation(xtrain, ytrain, 5, algorithm_func, kernel_func, param, k_classes, epoch_lim=epoch_lim)
+            minparam, minparam_testerror, crossValdf= cross_validation(xtrain, ytrain, 5, algorithm_func, kernel_func, param, k_classes, epoch_lim=epoch_lim)
 
             best_params.append({
                 "run": int(i),
-                "best_param": float(minparam)
+                "best_param": float(minparam),
+                "test_error": minparam_testerror
             })
             alpha, y_pred_test, me_train, me_test, _, _, confMatrix_r = algorithm_func(None, kernel_func, k_classes, epoch=epoch_lim, split=split, confusion=confusion, d=minparam, c=minparam)
             results[i, 0, 0] = me_train
@@ -424,9 +744,9 @@ def r_sims_k_class_ker_perc(df, r, k_classes, param, algorithm_func=k_class_one_
         avgconfMatrix = np.mean(confMatrix, axis=0)
         sdconfMatrix = np.std(confMatrix, axis=0)
         fullconfMatrix = np.stack((avgconfMatrix, sdconfMatrix), axis=2)
-        return avgme_df, fullconfMatrix, hard, hard_pred
+        return avgme_df, fullconfMatrix, hard, hard_pred, best_params
     else :
-        return avgme_df, hard, hard_pred
+        return avgme_df, hard, hard_pred, best_params
 
 def plot_pixel_images(hard, hard_pred):
     n = len(hard)
@@ -444,21 +764,23 @@ url = 'http://www0.cs.ucl.ac.uk/staff/M.Herbster/SL/misc/zipcombo.dat'
 data = np.loadtxt("zipcombo.dat")
 df = pd.DataFrame(data)
 # df = pd.read_csv(url, sep=r"\s+", header=None)
-dftest = df.sample(frac=0.30, random_state=0).reset_index(drop=True)
+dftest = df.sample(frac=0.05, random_state=0).reset_index(drop=True)
 print(df.head())
 
 print('Q1')
 
 print('Q2')
+epoch = 10
 start = time.time()
-alpha, train_errors, y_pred, test_errors =two_class_ker_perc_full(df, poly_kern, 5, 10)
+alpha, train_errors, xtrain_online, y_pred, test_errors =two_class_ker_perc_full(dftest, poly_kern, 5, 100)
 print('Two class kernel perceptron classifier, one vs rest')
 print('Polynomial Kernel : 1 run')
 print('Target class = 5')
 print(f'Train error = {train_errors}, Test error = {test_errors}')
 
+
 Classes = [0,1,2,3,4,5,6,7,8,9]
-alpha, y_pred_test, me_train, me_test, train_errors, test_errors, _ = k_class_one_vs_rest_ker_perc(df, poly_kern, Classes, 10)
+alpha, y_pred_test, me_train, me_test, train_errors, test_errors, _ = k_class_one_vs_rest_ker_perc(dftest, poly_kern, Classes, 10)
 print('K class kernel perceptron classifier, one vs rest')
 print('Polynomial Kernel : 1 run')
 print('Target classes 0-9')
@@ -470,39 +792,149 @@ print('Q3')
 runs = 20
 rsplits = []
 for i in range(runs):
-    rsplits.append(train_test_split(df, i))
+    rsplits.append(train_test_split(dftest, i))
 d=[1,2,3,4,5,6,7]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=d, split=rsplits)
+avgme_df, _, _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=d, epoch_lim = epoch, splits=rsplits)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs rest')
 print(f'Polynomial Kernel : {runs} runs')
 print(avgme_df)
 
+postprocess_q3(
+    avgme_df=avgme_df,
+    model_id="OvR_poly"
+)
+
+
+
+# q3_table = pd.DataFrame({
+#     "d": avgme_df["param"],
+#     "mean train error rates (%)": (
+#         100 * avgme_df["avg_me_train"]
+#     ).round(3).astype(str)
+#     + " ± "
+#     + (100 * avgme_df["avg_me_train_sd"]).round(3).astype(str),
+#     "mean test error rates (%)": (
+#         100 * avgme_df["avg_me_test"]
+#     ).round(3).astype(str)
+#     + " ± "
+#     + (100 * avgme_df["avg_me_test_sd"]).round(3).astype(str),
+# })
+#
+# save_outputs(
+#     question_id="Q3",
+#     tables={
+#         "poly_summary": q3_table
+#     },
+#     jsons={
+#         "alpha": alpha,
+#         "train_test_stats": {
+#             "d": q3_table["d"].tolist(),
+#             "train_mean": avgme_df["avg_me_train"].tolist(),
+#             "train_sd": avgme_df["avg_me_train_sd"].tolist(),
+#             "test_mean": avgme_df["avg_me_test"].tolist(),
+#             "test_sd": avgme_df["avg_me_test_sd"].tolist(),
+#         }
+#     }
+# )
+
+
+
 print('Q4')
 runs = 20
 d=[1,2,3,4,5,6,7]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, avgconfMatrix, hard, hard_pred = r_sims_k_class_ker_perc(df, runs, Classes, param=d, split=rsplits, crossVal=True, confusion=True)
+avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(dftest, runs, Classes, param=d, epoch_lim=epoch, splits=rsplits, crossVal=True, confusion=True)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs rest')
 print(f'Polynomial Kernel : {runs} runs with cross validation')
 print(avgme_df)
 
+# q4_table = pd.DataFrame({
+#     "run": [(bp["run"]+1) for bp in best_params],
+#     "d*": [int(bp["best_param"]) for bp in best_params],
+#     "test error rate (%)": [(100*bp["test_error"]).round(4) for bp in best_params]
+# })
+#
+# save_outputs(
+#     question_id="Q4",
+#     tables={
+#         "cv_runs": q4_table
+#     }
+# )
+
+
 print('Q5')
 print('Average Confusion Matrix')
+avgconfMatrix_raw = avgconfMatrix.copy()
 avgconfMatrix = confusion_matrix_df(avgconfMatrix, Classes)
 print(avgconfMatrix)
 
+# avgconfMatrix_pct = avgconfMatrix.copy()
+# conf_pct = np.empty((len(Classes), len(Classes)), dtype=object)
+#
+# for i in range(len(Classes)):
+#     for j in range(len(Classes)):
+#         mean = avgconfMatrix_raw[i, j, 0] * 100
+#         sd = avgconfMatrix_raw[i, j, 1] * 100
+#         conf_pct[i, j] = f"{mean:.3f} ± {sd:.3f}"
+#
+# conf_pct_df = pd.DataFrame(
+#     conf_pct,
+#     index=[str(c) for c in Classes],
+#     columns=[str(c) for c in Classes]
+# )
+# conf_json = {
+#     "classes": Classes,
+#     "mean_percent": (avgconfMatrix_raw[:, :, 0] * 100).tolist(),
+#     "std_percent":  (avgconfMatrix_raw[:, :, 1] * 100).tolist()
+# }
+# save_json(conf_json, "Q5_avg_confusion_matrix_pct.json")
+# conf_q5_df = conf_pct_df.copy()
+#
+# # Give the index a name so it appears as the first column header
+# conf_q5_df.index.name = r" "
+#
+# # Bold column headers
+# conf_q5_df.columns = [f"\\textbf{{{c}}}" for c in conf_q5_df.columns]
+# def df_to_tex_with_index(df, filename: str):
+#     path = os.path.join("outputs", "tex", filename)
+#     os.makedirs(os.path.dirname(path), exist_ok=True)
+#     df.to_latex(
+#         path,
+#         index=True,          # <-- key difference
+#         header=True,
+#         escape=False
+#     )
+# df_to_tex_with_index(conf_q5_df, "Q5_avg_confusion_matrix_pct.tex")
+# wrap_latex_table_small("outputs/tex/Q5_avg_confusion_matrix_pct.tex")
 
 
 print('Q6')
 print('hard')
 fig, ax = plot_pixel_images(hard, hard_pred)
+
+# save_outputs(
+#     question_id="Q6",
+#     figures={
+#         "hard_examples": fig
+#     }
+# )
+
+postprocess_experiment(
+    question_prefix="OvR_poly",
+    avgme_df=avgme_df,
+    best_params=best_params,
+    avgconfMatrix=avgconfMatrix_raw,
+    hard=hard,
+    hard_pred=hard_pred,
+    classes=Classes
+)
 
 print('Q7')
 print('(b)')
@@ -511,12 +943,20 @@ runs = 20
 c = [2**(-b/2) for b in range(6, 13)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _ , _ = r_sims_k_class_ker_perc(df, runs, Classes, param=c, kernel_func=guass_kern, split=rsplits)
+avgme_df, _ , _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch, splits=rsplits)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs rest')
 print(f'Guassian Kernel : {runs} runs')
 print(avgme_df)
+
+postprocess_q3(
+    avgme_df=avgme_df,
+    model_id="OvR_gauss",
+    param_symbol="c"
+)
+
+
 
 print('(c)')
 runs = 20
@@ -524,7 +964,7 @@ runs = 20
 c = [2**(-b/2) for b in range(6, 13)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, avgconfMatrix, hard, hard_pred = r_sims_k_class_ker_perc(df, runs, Classes, param=c, kernel_func=guass_kern, split=rsplits, crossVal=True, confusion=True)
+avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim=epoch, splits=rsplits, crossVal=True, confusion=True)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs rest')
@@ -532,10 +972,22 @@ print(f'Guassian Kernel : {runs} runs with cross validation')
 print(avgme_df)
 
 print('Average Confusion Matrix')
+avgconfMatrix_raw = avgconfMatrix.copy()
 avgconfMatrix = confusion_matrix_df(avgconfMatrix, Classes)
 print(avgconfMatrix)
 
 fig, ax = plot_pixel_images(hard, hard_pred)
+
+postprocess_experiment(
+    question_prefix="OvR_guass",
+    avgme_df=avgme_df,
+    best_params=best_params,
+    avgconfMatrix=avgconfMatrix_raw,
+    hard=hard,
+    hard_pred=hard_pred,
+    classes=Classes,
+    param_symbol="c"
+)
 
 print('Q8')
 print('(a)')
@@ -545,19 +997,26 @@ runs = 20
 d=[1,2,3,4,5,6,7]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=d, algorithm_func=k_class_one_vs_one_ker_perc, split=rsplits)
+avgme_df, _, _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=d, algorithm_func=k_class_one_vs_one_ker_perc, epoch_lim = epoch, splits=rsplits)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs one')
 print(f'Polynomial Kernel : {runs} runs')
 print(avgme_df)
 
+postprocess_q3(
+    avgme_df=avgme_df,
+    model_id="OvO_poly"
+)
+
+
+
 print('(c)')
 runs = 20
 d=[1,2,3,4,5,6,7]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, avgconfMatrix, hard, hard_pred = r_sims_k_class_ker_perc(df, runs, Classes, param=d, algorithm_func=k_class_one_vs_one_ker_perc, split=rsplits, crossVal=True, confusion=True)
+avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(dftest, runs, Classes, param=d, algorithm_func=k_class_one_vs_one_ker_perc, epoch_lim = epoch, splits=rsplits, crossVal=True, confusion=True)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs one')
@@ -565,28 +1024,46 @@ print(f'Polynomial Kernel : {runs} runs with cross validation')
 print(avgme_df)
 
 print('Average Confusion Matrix')
+avgconfMatrix_raw = avgconfMatrix.copy()
 avgconfMatrix = confusion_matrix_df(avgconfMatrix, Classes)
 print(avgconfMatrix)
 
 fig, ax = plot_pixel_images(hard, hard_pred)
+
+postprocess_experiment(
+    question_prefix="OvO_poly",
+    avgme_df=avgme_df,
+    best_params=best_params,
+    avgconfMatrix=avgconfMatrix_raw,
+    hard=hard,
+    hard_pred=hard_pred,
+    classes=Classes
+)
 
 print('Extension : one vs one Gaussian kenrel')
 runs = 20
 c = [2**(-b/2) for b in range(6, 13)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, split=rsplits)
+avgme_df, _, _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, epoch_lim=epoch, splits=rsplits)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs one')
 print(f'Guassian Kernel : {runs} runs')
 print(avgme_df)
 
+postprocess_q3(
+    avgme_df=avgme_df,
+    model_id="OvO_guass",
+    param_symbol="c"
+)
+
+
 runs = 20
 c = [2**(-b/2) for b in range(6, 13)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, avgconfMatrix, hard, hard_pred = r_sims_k_class_ker_perc(df, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, split=rsplits, crossVal=True, confusion=True)
+avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, epoch_lim = epoch, splits=rsplits, crossVal=True, confusion=True)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs one')
@@ -594,10 +1071,22 @@ print(f'Guassian Kernel : {runs} runs with cross validation')
 print(avgme_df)
 
 print('Average Confusion Matrix')
+avgconfMatrix_raw = avgconfMatrix.copy()
 avgconfMatrix = confusion_matrix_df(avgconfMatrix, Classes)
 print(avgconfMatrix)
 
 fig, ax = plot_pixel_images(hard, hard_pred)
+
+postprocess_experiment(
+    question_prefix="OvO_guass",
+    avgme_df=avgme_df,
+    best_params=best_params,
+    avgconfMatrix=avgconfMatrix_raw,
+    hard=hard,
+    hard_pred=hard_pred,
+    classes=Classes,
+    param_symbol="c"
+)
 
 print('(d)')
 
