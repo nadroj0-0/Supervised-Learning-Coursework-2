@@ -603,8 +603,10 @@ def k_class_one_vs_rest_ker_perc (df, kernel_func, k_classes, epoch=1, split=Non
         alpha.append(alpha_k) #Add k vs rest alpha values to alpha list
         xtrain_online.append(xtrain_online_k)
         train_errors.append(train_errors_k)
+    y_pred_train, global_train_errors, _ = k_class_one_vs_rest_ker_perc_pred(alpha, xtrain, ytrain, xtrain_online, k_classes, K_precal_train)
     y_pred_test, test_errors, confMatrix = k_class_one_vs_rest_ker_perc_pred(alpha, xtest, ytest, xtrain_online, k_classes, K_precal_test, confusion)
     me_train = np.mean(train_errors)
+    me_train = global_train_errors
     me_test = np.mean(test_errors)
     return alpha, y_pred_test, me_train, me_test, train_errors, test_errors, confMatrix
 
@@ -618,7 +620,8 @@ def k_class_one_vs_one_ker_perc_pred (alpha, x, y, xtrain_online, k_classes, K_p
         for i, _ in enumerate(k_classes):
             for k, _ in enumerate (k_classes):
                 if k<i :
-                    K_test_pair = K_precal_test[(i,k)]["K"]
+                    # K_test_pair = K_precal_test[(i,k)]["K"]
+                    K_test_pair = K_precal_test[(i, k)]
                     # testPos = K_precal_test[(i,k)]["testPos"]
                     # if j not in testPos:
                     #     continue
@@ -690,12 +693,16 @@ def k_class_one_vs_one_ker_perc(df, kernel_func, k_classes, epoch=1, split=None,
                 alpha_ik, train_errors_ik, xtrain_online_ik, _, _ = two_class_ker_perc_full(None, kernel_func, i, epoch=epoch,K_precal_train=K_train_pair,split=split, trainhelper=True)  # Train 2 class classifier, (k vs rest)
                 alpha[(i,k)] = alpha_ik  # Add k vs rest alpha values to alpha list
                 xtrain_online[(i,k)] = xtrain_online_ik
-                K_train_pairs[(i, k)] = K_train_pair
-                K_test_pairs[(i, k)] = {"K": K_test_pair}
+                # K_train_pairs[(i, k)] = K_train_pair
+                K_train_pairs[(i, k)] = K_precal_train[:,trainPos]
+                # K_test_pairs[(i, k)] = {"K": K_test_pair}
+                K_test_pairs[(i, k)] = K_test_pair
                 # K_test_pairs[(i,k)] = {"K" : K_test_pair, "testPos": testPos}
                 train_errors.append(train_errors_ik)
+    y_pred_train, global_train_errors, _ = k_class_one_vs_one_ker_perc_pred(alpha, xtrain, ytrain, xtrain_online, k_classes, K_train_pairs)
     y_pred_test, test_errors, confMatrix = k_class_one_vs_one_ker_perc_pred(alpha, xtest, ytest, xtrain_online, k_classes, K_test_pairs, confusion)
     me_train = np.mean(train_errors)
+    me_train = global_train_errors
     me_test = np.mean(test_errors)
     return alpha, y_pred_test, me_train, me_test, train_errors, test_errors, confMatrix
 
@@ -831,7 +838,9 @@ url = 'http://www0.cs.ucl.ac.uk/staff/M.Herbster/SL/misc/zipcombo.dat'
 # data = np.loadtxt("zipcombo.dat")
 # df = pd.DataFrame(data)
 df = pd.read_csv(url, sep=r"\s+", header=None)
-dftest = df.sample(frac=0.15, random_state=0).reset_index(drop=True)
+dftest = df.sample(frac=0.05, random_state=0).reset_index(drop=True)
+# df2=df
+# df=dftest
 print(df.head())
 
 print('Q1')
@@ -996,7 +1005,7 @@ runs=1
 c = [2**(-b/2) for b in range(9, 16)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _ , _, _ = r_sims_k_class_ker_perc(df2, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch)
+avgme_df, _ , _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch)
 end = time.time()
 print(f'c = {c}')
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
