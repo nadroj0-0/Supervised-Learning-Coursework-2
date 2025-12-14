@@ -75,6 +75,54 @@ def wrap_latex_table_small(path):
     with open(path, "w") as f:
         f.write(wrapped)
 
+def plot_gaussian_param_curve(
+    avgme_df: pd.DataFrame,
+    *,
+    title: str,
+    show_as_powers: bool = False,
+    b_values: list[int] | None = None
+):
+    """
+    Plot test error vs Gaussian kernel parameter c.
+
+    Parameters
+    ----------
+    avgme_df : pd.DataFrame
+        Must contain columns: 'param', 'avg_me_test'
+    title : str
+        Plot title (LaTeX allowed)
+    show_as_powers : bool
+        If True, x-axis labels shown as 2^{-b/2}
+    b_values : list[int] | None
+        Required if show_as_powers=True.
+        Must align with avgme_df rows.
+    """
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+
+    x = avgme_df["param"].values
+    y = avgme_df["avg_me_test"].values
+
+    ax.plot(x, y, marker="o", linewidth=2)
+    ax.set_ylabel("Test error rate")
+    ax.set_xlabel("Gaussian kernel parameter $c$")
+    ax.set_title(title)
+
+    if show_as_powers:
+        if b_values is None:
+            raise ValueError("b_values must be provided when show_as_powers=True")
+
+        labels = [rf"$2^{{-{b}/2}}$" for b in b_values]
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45)
+
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    return fig, ax
+
+
+
 def postprocess_q3(*, avgme_df: pd.DataFrame, model_id: str, param_symbol: str = "d"):
     """
     Post-process Q3-style results with automatic filenames.
@@ -564,15 +612,17 @@ def k_class_one_vs_one_ker_perc_pred (alpha, x, y, xtrain_online, k_classes, K_p
     y_pred = []
     total_errors = 0
     for j in range(len(x)):
-        y_hat = np.zeros(len(k_classes))
-        for i, a in enumerate(k_classes):
-            for k, b in enumerate (k_classes):
+        votes = np.zeros(len(k_classes))
+        played = np.zeros(len(k_classes))
+        earlyStop = False
+        for i, _ in enumerate(k_classes):
+            for k, _ in enumerate (k_classes):
                 if k<i :
                     K_test_pair = K_precal_test[(i,k)]["K"]
-                    testPos = K_precal_test[(i,k)]["testPos"]
-                    if j not in testPos:
-                        continue
-                    K_test_pair_jrow = np.where(testPos == j)[0][0]
+                    # testPos = K_precal_test[(i,k)]["testPos"]
+                    # if j not in testPos:
+                    #     continue
+                    # K_test_pair_jrow = np.where(testPos == j)[0][0]
                     # K = K_test_pair[K_test_pair_jrow, :]
                     # K = np.array(K)
                     A = np.array(alpha[(i,k)])
@@ -580,14 +630,30 @@ def k_class_one_vs_one_ker_perc_pred (alpha, x, y, xtrain_online, k_classes, K_p
                     if len(A) == 0:
                         score=0
                     else :
-                        K = K_test_pair[K_test_pair_jrow, xtrain_online_ik]
+                        # K = K_test_pair[K_test_pair_jrow, xtrain_online_ik]
+                        K = K_test_pair[j, xtrain_online_ik]
                         score = (A @ K)
                     # if (alpha[(i,k)] @ K) >= 0:
                     if score >= 0:
-                        y_hat[i] = y_hat[i]+1
+                        votes[i] = votes[i]+1
                     else:
-                        y_hat[k] = y_hat[k]+1
-        y_pred.append(k_classes[np.argmax(y_hat)])
+                        votes[k] = votes[k]+1
+                    played[i] = played[i]+1
+                    played[k] = played[k]+1
+                    currentMostVotes = np.argmax(votes)
+                    # Remaining models that can vote for a class = total amount of models that can vote for a class (k-1)
+                    # - the models (that can vote for that class) that have already voted
+                    remaining = (len(k_classes)-1) - played
+                    # Given current votes each class already has, the maximum votes they can get is the votes they currently have
+                    # + the amount of models left to vote that contain give them additional votes (assuming they win all remaining model votes)
+                    maxPossibleVotes = votes + remaining
+                    maxPossibleVotes[currentMostVotes] = -np.inf
+                    if votes[currentMostVotes] > np.max(maxPossibleVotes):
+                        earlyStop = True
+                        break
+            if earlyStop == True :
+                break
+        y_pred.append(k_classes[np.argmax(votes)])
         if y_pred[j] != y[j]:
             total_errors = total_errors + 1
     if confusion == True:
@@ -614,18 +680,19 @@ def k_class_one_vs_one_ker_perc(df, kernel_func, k_classes, epoch=1, split=None,
                 trainPos = np.where((ytrain == i)|((ytrain == k)))[0]
                 ytrain_pair = ytrain[trainPos]
                 xtrain_pair = xtrain[trainPos]
-                testPos = np.where((ytest == i) | ((ytest == k)))[0]
-                ytest_pair = ytest[testPos]
-                xtest_pair = xtest[testPos]
+                # testPos = np.where((ytest == i) | ((ytest == k)))[0]
+                # ytest_pair = ytest[testPos]
+                # xtest_pair = xtest[testPos]
                 split = (xtrain_pair, None, ytrain_pair, None)
                 K_train_pair = K_precal_train[np.ix_(trainPos, trainPos)]  # Precalculate the Kernel Matrix
-                # K_test_pair  = K_precal_test[:,trainPos]
-                K_test_pair = K_precal_test[np.ix_(testPos, trainPos)]
+                K_test_pair  = K_precal_test[:,trainPos]
+                # K_test_pair = K_precal_test[np.ix_(testPos, trainPos)]
                 alpha_ik, train_errors_ik, xtrain_online_ik, _, _ = two_class_ker_perc_full(None, kernel_func, i, epoch=epoch,K_precal_train=K_train_pair,split=split, trainhelper=True)  # Train 2 class classifier, (k vs rest)
                 alpha[(i,k)] = alpha_ik  # Add k vs rest alpha values to alpha list
                 xtrain_online[(i,k)] = xtrain_online_ik
                 K_train_pairs[(i, k)] = K_train_pair
-                K_test_pairs[(i,k)] = {"K" : K_test_pair, "testPos": testPos}
+                K_test_pairs[(i, k)] = {"K": K_test_pair}
+                # K_test_pairs[(i,k)] = {"K" : K_test_pair, "testPos": testPos}
                 train_errors.append(train_errors_ik)
     y_pred_test, test_errors, confMatrix = k_class_one_vs_one_ker_perc_pred(alpha, xtest, ytest, xtrain_online, k_classes, K_test_pairs, confusion)
     me_train = np.mean(train_errors)
@@ -759,12 +826,12 @@ def plot_pixel_images(hard, hard_pred):
         ax[j].axis("off")
     return fig, ax
 
-
+startTotal = time.time()
 url = 'http://www0.cs.ucl.ac.uk/staff/M.Herbster/SL/misc/zipcombo.dat'
-data = np.loadtxt("zipcombo.dat")
-df = pd.DataFrame(data)
-# df = pd.read_csv(url, sep=r"\s+", header=None)
-dftest = df.sample(frac=0.05, random_state=0).reset_index(drop=True)
+# data = np.loadtxt("zipcombo.dat")
+# df = pd.DataFrame(data)
+df = pd.read_csv(url, sep=r"\s+", header=None)
+dftest = df.sample(frac=0.15, random_state=0).reset_index(drop=True)
 print(df.head())
 
 print('Q1')
@@ -772,7 +839,7 @@ print('Q1')
 print('Q2')
 epoch = 10
 start = time.time()
-alpha, train_errors, xtrain_online, y_pred, test_errors =two_class_ker_perc_full(dftest, poly_kern, 5, 100)
+alpha, train_errors, xtrain_online, y_pred, test_errors =two_class_ker_perc_full(df, poly_kern, 5, 100)
 print('Two class kernel perceptron classifier, one vs rest')
 print('Polynomial Kernel : 1 run')
 print('Target class = 5')
@@ -780,7 +847,7 @@ print(f'Train error = {train_errors}, Test error = {test_errors}')
 
 
 Classes = [0,1,2,3,4,5,6,7,8,9]
-alpha, y_pred_test, me_train, me_test, train_errors, test_errors, _ = k_class_one_vs_rest_ker_perc(dftest, poly_kern, Classes, 10)
+alpha, y_pred_test, me_train, me_test, train_errors, test_errors, _ = k_class_one_vs_rest_ker_perc(df, poly_kern, Classes, 10)
 print('K class kernel perceptron classifier, one vs rest')
 print('Polynomial Kernel : 1 run')
 print('Target classes 0-9')
@@ -792,11 +859,11 @@ print('Q3')
 runs = 20
 rsplits = []
 for i in range(runs):
-    rsplits.append(train_test_split(dftest, i))
+    rsplits.append(train_test_split(df, i))
 d=[1,2,3,4,5,6,7]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _, _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=d, epoch_lim = epoch, splits=rsplits)
+avgme_df, _, _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=d, epoch_lim = epoch, splits=rsplits)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs rest')
@@ -809,122 +876,30 @@ postprocess_q3(
 )
 
 
-
-# q3_table = pd.DataFrame({
-#     "d": avgme_df["param"],
-#     "mean train error rates (%)": (
-#         100 * avgme_df["avg_me_train"]
-#     ).round(3).astype(str)
-#     + " ± "
-#     + (100 * avgme_df["avg_me_train_sd"]).round(3).astype(str),
-#     "mean test error rates (%)": (
-#         100 * avgme_df["avg_me_test"]
-#     ).round(3).astype(str)
-#     + " ± "
-#     + (100 * avgme_df["avg_me_test_sd"]).round(3).astype(str),
-# })
-#
-# save_outputs(
-#     question_id="Q3",
-#     tables={
-#         "poly_summary": q3_table
-#     },
-#     jsons={
-#         "alpha": alpha,
-#         "train_test_stats": {
-#             "d": q3_table["d"].tolist(),
-#             "train_mean": avgme_df["avg_me_train"].tolist(),
-#             "train_sd": avgme_df["avg_me_train_sd"].tolist(),
-#             "test_mean": avgme_df["avg_me_test"].tolist(),
-#             "test_sd": avgme_df["avg_me_test_sd"].tolist(),
-#         }
-#     }
-# )
-
-
-
 print('Q4')
 runs = 20
 d=[1,2,3,4,5,6,7]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(dftest, runs, Classes, param=d, epoch_lim=epoch, splits=rsplits, crossVal=True, confusion=True)
+avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(df, runs, Classes, param=d, epoch_lim=epoch, splits=rsplits, crossVal=True, confusion=True)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs rest')
 print(f'Polynomial Kernel : {runs} runs with cross validation')
 print(avgme_df)
-
-# q4_table = pd.DataFrame({
-#     "run": [(bp["run"]+1) for bp in best_params],
-#     "d*": [int(bp["best_param"]) for bp in best_params],
-#     "test error rate (%)": [(100*bp["test_error"]).round(4) for bp in best_params]
-# })
 #
-# save_outputs(
-#     question_id="Q4",
-#     tables={
-#         "cv_runs": q4_table
-#     }
-# )
-
-
+#
 print('Q5')
 print('Average Confusion Matrix')
 avgconfMatrix_raw = avgconfMatrix.copy()
 avgconfMatrix = confusion_matrix_df(avgconfMatrix, Classes)
 print(avgconfMatrix)
-
-# avgconfMatrix_pct = avgconfMatrix.copy()
-# conf_pct = np.empty((len(Classes), len(Classes)), dtype=object)
 #
-# for i in range(len(Classes)):
-#     for j in range(len(Classes)):
-#         mean = avgconfMatrix_raw[i, j, 0] * 100
-#         sd = avgconfMatrix_raw[i, j, 1] * 100
-#         conf_pct[i, j] = f"{mean:.3f} ± {sd:.3f}"
 #
-# conf_pct_df = pd.DataFrame(
-#     conf_pct,
-#     index=[str(c) for c in Classes],
-#     columns=[str(c) for c in Classes]
-# )
-# conf_json = {
-#     "classes": Classes,
-#     "mean_percent": (avgconfMatrix_raw[:, :, 0] * 100).tolist(),
-#     "std_percent":  (avgconfMatrix_raw[:, :, 1] * 100).tolist()
-# }
-# save_json(conf_json, "Q5_avg_confusion_matrix_pct.json")
-# conf_q5_df = conf_pct_df.copy()
-#
-# # Give the index a name so it appears as the first column header
-# conf_q5_df.index.name = r" "
-#
-# # Bold column headers
-# conf_q5_df.columns = [f"\\textbf{{{c}}}" for c in conf_q5_df.columns]
-# def df_to_tex_with_index(df, filename: str):
-#     path = os.path.join("outputs", "tex", filename)
-#     os.makedirs(os.path.dirname(path), exist_ok=True)
-#     df.to_latex(
-#         path,
-#         index=True,          # <-- key difference
-#         header=True,
-#         escape=False
-#     )
-# df_to_tex_with_index(conf_q5_df, "Q5_avg_confusion_matrix_pct.tex")
-# wrap_latex_table_small("outputs/tex/Q5_avg_confusion_matrix_pct.tex")
-
-
 print('Q6')
 print('hard')
 fig, ax = plot_pixel_images(hard, hard_pred)
 
-# save_outputs(
-#     question_id="Q6",
-#     figures={
-#         "hard_examples": fig
-#     }
-# )
 
 postprocess_experiment(
     question_prefix="OvR_poly",
@@ -937,13 +912,123 @@ postprocess_experiment(
 )
 
 print('Q7')
+print('(a) Explaining how S was chosen')
+runs=1
+c = [0.005, 0.01, 0.05, 0.1, 0.5 ,1, 5, 10]
+Classes = [0,1,2,3,4,5,6,7,8,9]
+start = time.time()
+avgme_df, _ , _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch)
+end = time.time()
+print(f'c = {c}')
+print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
+print('K class kernel perceptron classifier, one vs rest')
+print(f'Guassian Kernel : {runs} runs')
+print(avgme_df)
+fig, ax = plot_gaussian_param_curve(
+    avgme_df,
+    title="OvR Gaussian kernel: test error vs parameter $c$ (15% data subset, 1 run)",
+    show_as_powers=False
+)
+
+save_outputs(
+    question_id="Q7a_ovr_gauss_wide_15pct",
+    figures={"param_sweep": fig}
+)
+
+
+
+
+
+runs=1
+c = [2**(-b/2) for b in range(10, 20)]
+Classes = [0,1,2,3,4,5,6,7,8,9]
+start = time.time()
+avgme_df, _ , _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch)
+end = time.time()
+print(f'c = {c}')
+print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
+print('K class kernel perceptron classifier, one vs rest')
+print(f'Guassian Kernel : {runs} runs')
+print(avgme_df)
+b_vals = list(range(10, 20))
+
+fig, ax = plot_gaussian_param_curve(
+    avgme_df,
+    title="OvR Gaussian kernel: test error vs parameter $c$ (15% data subset, 1 run)",
+    show_as_powers=True,
+    b_values=b_vals
+)
+
+save_outputs(
+    question_id="Q7a_ovr_gauss_logfine_15pct",
+    figures={"param_sweep": fig}
+)
+
+
+
+runs=1
+c = [2**(-b/2) for b in range(11, 18)]
+Classes = [0,1,2,3,4,5,6,7,8,9]
+start = time.time()
+avgme_df, _ , _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch)
+end = time.time()
+print(f'c = {c}')
+print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
+print('K class kernel perceptron classifier, one vs rest')
+print(f'Guassian Kernel : {runs} runs')
+print(avgme_df)
+b_vals = list(range(11, 18))
+
+fig, ax = plot_gaussian_param_curve(
+    avgme_df,
+    title="OvR Gaussian kernel: test error vs parameter $c$ (15% data subset, 1 run)",
+    show_as_powers=True,
+    b_values=b_vals
+)
+
+save_outputs(
+    question_id="Q7a_ovr_gauss_logfiner_15pct",
+    figures={"param_sweep": fig}
+)
+
+
+runs=1
+c = [2**(-b/2) for b in range(9, 16)]
+Classes = [0,1,2,3,4,5,6,7,8,9]
+start = time.time()
+avgme_df, _ , _, _ = r_sims_k_class_ker_perc(df2, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch)
+end = time.time()
+print(f'c = {c}')
+print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
+print('K class kernel perceptron classifier, one vs rest')
+print(f'Guassian Kernel : {runs} runs')
+print(avgme_df)
+b_vals = list(range(9, 16))
+
+fig, ax = plot_gaussian_param_curve(
+    avgme_df,
+    title="OvR Gaussian kernel: test error vs parameter $c$ (full dataset, 1 run)",
+    show_as_powers=True,
+    b_values=b_vals
+)
+
+save_outputs(
+    question_id="Q7a_ovr_gauss_logfiner_full",
+    figures={"param_sweep": fig}
+)
+
+
+
+
+
+
 print('(b)')
 runs = 20
 # c= np.linspace(0.045, 0.055, 50).tolist()
-c = [2**(-b/2) for b in range(6, 13)]
+c = [2**(-b/2) for b in range(9, 16)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _ , _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch, splits=rsplits)
+avgme_df, _ , _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim= epoch, splits=rsplits)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs rest')
@@ -961,10 +1046,10 @@ postprocess_q3(
 print('(c)')
 runs = 20
 # c= np.linspace(0.045, 0.055, 50).tolist()
-c = [2**(-b/2) for b in range(6, 13)]
+c = [2**(-b/2) for b in range(9, 16)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim=epoch, splits=rsplits, crossVal=True, confusion=True)
+avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(df, runs, Classes, param=c, kernel_func=guass_kern, epoch_lim=epoch, splits=rsplits, crossVal=True, confusion=True)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs rest')
@@ -997,7 +1082,7 @@ runs = 20
 d=[1,2,3,4,5,6,7]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _, _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=d, algorithm_func=k_class_one_vs_one_ker_perc, epoch_lim = epoch, splits=rsplits)
+avgme_df, _, _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=d, algorithm_func=k_class_one_vs_one_ker_perc, epoch_lim = epoch, splits=rsplits)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs one')
@@ -1016,7 +1101,7 @@ runs = 20
 d=[1,2,3,4,5,6,7]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(dftest, runs, Classes, param=d, algorithm_func=k_class_one_vs_one_ker_perc, epoch_lim = epoch, splits=rsplits, crossVal=True, confusion=True)
+avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(df, runs, Classes, param=d, algorithm_func=k_class_one_vs_one_ker_perc, epoch_lim = epoch, splits=rsplits, crossVal=True, confusion=True)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs one')
@@ -1042,10 +1127,10 @@ postprocess_experiment(
 
 print('Extension : one vs one Gaussian kenrel')
 runs = 20
-c = [2**(-b/2) for b in range(6, 13)]
+c = [2**(-b/2) for b in range(9, 16)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, _, _, _ = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, epoch_lim=epoch, splits=rsplits)
+avgme_df, _, _, _ = r_sims_k_class_ker_perc(df, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, epoch_lim=epoch, splits=rsplits)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs one')
@@ -1060,10 +1145,10 @@ postprocess_q3(
 
 
 runs = 20
-c = [2**(-b/2) for b in range(6, 13)]
+c = [2**(-b/2) for b in range(9, 16)]
 Classes = [0,1,2,3,4,5,6,7,8,9]
 start = time.time()
-avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(dftest, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, epoch_lim = epoch, splits=rsplits, crossVal=True, confusion=True)
+avgme_df, avgconfMatrix, hard, hard_pred, best_params = r_sims_k_class_ker_perc(df, runs, Classes, param=c, algorithm_func=k_class_one_vs_one_ker_perc, kernel_func=guass_kern, epoch_lim = epoch, splits=rsplits, crossVal=True, confusion=True)
 end = time.time()
 print(f"\nTotal runtime = {end - start:.2f} seconds ({(end-start)/60:.2f} minutes)")
 print('K class kernel perceptron classifier, one vs one')
@@ -1090,7 +1175,8 @@ postprocess_experiment(
 
 print('(d)')
 
-
+endTotal = time.time()
+print(f"\nTotal script runtime = {endTotal - startTotal:.2f} seconds ({(endTotal-startTotal)/60:.2f} minutes)")
 plt.show()
 plt.close()
 
