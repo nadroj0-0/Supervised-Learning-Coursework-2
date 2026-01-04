@@ -518,8 +518,21 @@ def k_class_one_vs_rest_online_ker_perc (df, kernel_func, k_classes, epoch=1, sp
                     ylabel_class = -1
                 update_model(scores[j], ylabel_class, alpha[k], xtrain_online[k], i)
     train_error = total_errors / (t+1)
-    total_errors = 0
 
+    # --- evaluate trained model on TRAINING set ---
+    train_errors = 0
+    for i in range(len(xtrain)):
+        scores = []
+        for k in k_classes:
+            score = predict(alpha[k], xtrain_online[k], K_precal_train[i, :])
+            scores.append(score)
+        y_hat = k_classes[np.argmax(scores)]
+        if y_hat != ytrain[i]:
+            train_errors += 1
+
+    train_error = train_errors / len(xtrain)
+
+    total_errors = 0
     for i in range(len(xtest)):
         scores = []
         for k in k_classes:
@@ -590,6 +603,23 @@ def k_class_one_vs_one_online_ker_perc (df, kernel_func, k_classes, epoch=1, spl
                     update_model(pair_scores[(a,b)], ylabel_class, alpha[(a,b)], xtrain_online[(a,b)], i)
 
     train_error = total_errors / (t+1)
+
+    # --- evaluate trained model on TRAINING set ---
+    train_errors = 0
+    for i in range(len(xtrain)):
+        votes = np.zeros(len(k_classes))
+        for (a, b) in pairs:
+            score = predict(alpha[(a, b)], xtrain_online[(a, b)], K_precal_train[i, :])
+            if score >= 0:
+                votes[a] += 1
+            else:
+                votes[b] += 1
+        y_hat = k_classes[np.argmax(votes)]
+        if y_hat != ytrain[i]:
+            train_errors += 1
+
+    train_error = train_errors / len(xtrain)
+
     total_errors = 0
 
     for i in range(len(xtest)):
@@ -755,7 +785,7 @@ print('Q1')
 
 
 print('Q2')
-epoch = 12
+epoch = 5
 start = time.time()
 # # alpha, train_errors, xtrain_online, y_pred, test_errors =two_class_ker_perc_full(df, poly_kern, 5, 100)
 # print('Two class kernel perceptron classifier, one vs rest')
